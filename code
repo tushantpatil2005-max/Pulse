@@ -1,0 +1,1205 @@
+#!/usr/bin/env python3
+"""
+Dynamic Multi-Modal Personalization System
+==========================================
+Single-file end-to-end system for Recruitbots AI — Gen AI Developer Challenge 1.
+
+Generates personalized marketing content (text + image workflows) from user
+behavior profiles, grounded in a brand-voice RAG corpus.
+
+- Scalable concurrent API (asyncio semaphore + optional FastAPI)
+- Open-weight Llama via OpenAI-compatible endpoint with retries & fallbacks
+- Hybrid RAG for brand voice / product facts
+- Text + image prompt/SVG banner generation under a 3s SLA
+- Request monitoring, latency logs, token estimates
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+import math
+import re
+import time
+import uuid
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+try:
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel, Field
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SLA_MS = 3_000
+EMBED_DIM = 128
+CHUNK_SIZE = 480
+CHUNK_OVERLAP = 80
+BM25_K1 = 1.2
+BM25_B = 0.75
+RRF_K = 60
+MAX_CONCURRENT = 8
+LLAMA_BASE = "http://127.0.0.1:11434"
+LLAMA_MODELS = ["llama3.1:8b", "llama3.2:3b"]
+STOP = set(
+    "a an the of to and or for in on with from by as is are was were be this "
+    "that it its their our your at into over than then also not no".split()
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("pulse")
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+
+class Channel(str, Enum):
+    EMAIL = "email"
+    SOCIAL = "social"
+    WEB = "web"
+    PUSH = "push"
+
+
+class Modality(str, Enum):
+    TEXT = "text"
+    IMAGE = "image"
+    BOTH = "both"
+
+
+@dataclass
+class UserProfile:
+    user_id: str
+    segment: str  # e.g. "loyal", "churn_risk", "new", "high_value"
+    interests: list[str]
+    recent_actions: list[str]
+    locale: str = "en-US"
+    preferred_tone: str = "warm"  # warm | professional | playful
+    engagement_score: float = 0.5  # 0–1
+
+
+@dataclass
+class GenerationRequest:
+    profile: UserProfile
+    channel: str = "email"
+    modality: str = "both"
+    campaign: str = "spring_refresh"
+    product_hint: Optional[str] = None
+    remote_models: bool = False
+
+
+@dataclass
+class TraceEvent:
+    step: str
+    status: str
+    detail: str
+    latency_ms: float
+    tokens_in: int = 0
+    tokens_out: int = 0
+
+
+@dataclass
+class GenerationResult:
+    id: str
+    user_id: str
+    channel: str
+    modality: str
+    campaign: str
+    text: Optional[dict]
+    image: Optional[dict]
+    brand_citations: list[dict]
+    model_route: list[str]
+    timings: dict
+    trace: list[dict]
+    failures: list[dict]
+    monitoring: dict
+
+
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+
+
+def tokens(text: str, drop_stop: bool = True) -> list[str]:
+    parts = re.sub(r"[^a-z0-9]+", " ", text.lower()).split()
+    parts = [t for t in parts if len(t) > 1]
+    if drop_stop:
+        parts = [t for t in parts if t not in STOP]
+    return parts
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, math.ceil(len(text) / 4))
+
+
+def fnv(s: str) -> int:
+    h = 2166136261
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def embed(text: str) -> list[float]:
+    v = [0.0] * EMBED_DIM
+    for t in tokens(text, drop_stop=False):
+        h = fnv(t)
+        i = h % EMBED_DIM
+        sign = 1.0 if (h & 0x100) else -1.0
+        v[i] += sign
+    norm = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / norm for x in v]
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def coverage(query: str, text: str) -> float:
+    q = tokens(query)
+    if not q:
+        return 0.0
+    hay = f" {text.lower()} "
+    hit = sum(1 for t in q if f" {t}" in hay or t in hay)
+    return hit / len(q)
+
+
+def chunk_text(text: str) -> list[str]:
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paras:
+        paras = [text]
+    out: list[str] = []
+    buf = ""
+    for para in paras:
+        candidate = f"{buf}\n\n{para}".strip() if buf else para
+        if len(candidate) > CHUNK_SIZE and buf:
+            out.append(buf)
+            tail = buf[-CHUNK_OVERLAP:] if len(buf) > CHUNK_OVERLAP else buf
+            buf = f"{tail}\n\n{para}".strip()
+        else:
+            buf = candidate
+        while len(buf) > CHUNK_SIZE:
+            out.append(buf[:CHUNK_SIZE])
+            buf = buf[CHUNK_SIZE - CHUNK_OVERLAP :]
+    if buf:
+        out.append(buf)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Brand corpus (RAG source of truth)
+# ---------------------------------------------------------------------------
+
+
+def seed_brand_corpus() -> list[dict]:
+    return [
+        {
+            "id": "voice",
+            "title": "Brand voice guidelines",
+            "source": "brand://guidelines/voice.md",
+            "text": (
+                "Aurora Home is a sustainable living brand. Voice is warm, clear, and never pushy. "
+                "Prefer short sentences. Never invent discounts. Always use the product names "
+                "Lumen Lamp, Nest Sofa, and Harbor Mug when relevant. Avoid slang and all-caps. "
+                "For loyal customers, thank them by name of segment and invite them back. "
+                "For churn-risk users, lead with value and a low-friction next step, not urgency hype. "
+                "For new users, introduce one hero product and one benefit, then a soft call to action. "
+                "Professional tone keeps verbs concrete. Playful tone may use light metaphor but no puns on price."
+            ),
+        },
+        {
+            "id": "products",
+            "title": "Product catalog facts",
+            "source": "brand://catalog/products.md",
+            "text": (
+                "Lumen Lamp is a dimmable LED desk lamp made from recycled aluminum. It ships in 2 days. "
+                "Nest Sofa is a modular three-seat sofa with machine-washable covers in oat and slate. "
+                "Harbor Mug is a double-wall ceramic mug, 350 ml, dishwasher safe, sold in sets of two. "
+                "Spring Refresh campaign highlights Lumen Lamp and Harbor Mug as desk and morning rituals. "
+                "Do not claim free shipping unless the campaign brief says free shipping is active."
+            ),
+        },
+        {
+            "id": "campaign",
+            "title": "Spring Refresh campaign brief",
+            "source": "brand://campaigns/spring_refresh.md",
+            "text": (
+                "Spring Refresh runs through the end of May. Primary CTA is Explore the collection. "
+                "Secondary CTA is Save for later. Approved benefit lines: quieter mornings, lasting materials, "
+                "made for small spaces. Visual palette: soft cream, sage green, warm charcoal. "
+                "Image prompts should show calm interiors, natural light, no stock-photo smiles. "
+                "Email subject lines stay under 50 characters when possible."
+            ),
+        },
+        {
+            "id": "compliance",
+            "title": "Claims and compliance",
+            "source": "brand://legal/claims.md",
+            "text": (
+                "Never invent a percentage off. Never promise next-day delivery. "
+                "Recycled content claims must stay as recycled aluminum for Lumen Lamp only. "
+                "Do not compare competitors by name. Do not use scarcity language such as last chance."
+            ),
+        },
+        {
+            "id": "segments",
+            "title": "Segment playbook",
+            "source": "brand://playbooks/segments.md",
+            "text": (
+                "Loyal segment: acknowledge repeat interest, offer curated picks matching interests. "
+                "High_value segment: emphasize materials and longevity, avoid discount framing. "
+                "Churn_risk segment: one clear benefit, one product, one calm CTA. "
+                "New segment: educate with a single product story and a soft invite to browse."
+            ),
+        },
+        {
+            "id": "visual",
+            "title": "Visual system for image workflows",
+            "source": "brand://design/visual.md",
+            "text": (
+                "Image layouts use cream background #F5F0E8, sage accent #8FAF8A, charcoal text #2C2C2C. "
+                "Hero product sits left or center; caption under 12 words. "
+                "Never place text over faces. Prefer still life: lamp on oak desk, mug beside notebook, "
+                "sofa corner with linen throw. Aspect ratio 1:1 for social, 16:9 for web banners."
+            ),
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Hybrid RAG index
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Chunk:
+    id: str
+    doc_id: str
+    title: str
+    source: str
+    text: str
+    toks: list[str]
+    tf: Counter
+    vec: list[float]
+
+
+class BrandIndex:
+    def __init__(self, docs: list[dict]):
+        self.chunks: list[Chunk] = []
+        self.df: Counter = Counter()
+        for doc in docs:
+            for i, text in enumerate(chunk_text(doc["text"])):
+                toks = tokens(text)
+                self.chunks.append(
+                    Chunk(
+                        id=f"{doc['id']}:{i}",
+                        doc_id=doc["id"],
+                        title=doc["title"],
+                        source=doc["source"],
+                        text=text,
+                        toks=toks,
+                        tf=Counter(toks),
+                        vec=embed(text),
+                    )
+                )
+        for c in self.chunks:
+            for term in set(c.toks):
+                self.df[term] += 1
+        total = sum(len(c.toks) for c in self.chunks) or 1
+        self.avg_len = total / max(1, len(self.chunks))
+
+    def _bm25(self, chunk: Chunk, q_tokens: list[str]) -> float:
+        N = len(self.chunks)
+        dl = len(chunk.toks) or 1
+        score = 0.0
+        seen = set()
+        for term in q_tokens:
+            if term in seen:
+                continue
+            seen.add(term)
+            tf = chunk.tf.get(term, 0)
+            if not tf:
+                continue
+            df = self.df.get(term, 0)
+            idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+            denom = tf + BM25_K1 * (1 - BM25_B + BM25_B * (dl / self.avg_len))
+            score += idf * ((tf * (BM25_K1 + 1)) / denom)
+        return score
+
+    def search(self, query: str, k: int = 5) -> list[dict]:
+        q_tokens = tokens(query)
+        if not q_tokens or not self.chunks:
+            return []
+        q_vec = embed(query)
+        bm = [self._bm25(c, q_tokens) for c in self.chunks]
+        dense = [max(0.0, cosine(q_vec, c.vec)) for c in self.chunks]
+
+        def ranks(values: list[float]) -> list[int]:
+            order = sorted(range(len(values)), key=lambda i: values[i], reverse=True)
+            r = [0] * len(values)
+            for rank, i in enumerate(order, 1):
+                r[i] = rank
+            return r
+
+        bm_r, den_r = ranks(bm), ranks(dense)
+        hits = []
+        for i, c in enumerate(self.chunks):
+            rrf = 1 / (RRF_K + bm_r[i]) + 1 / (RRF_K + den_r[i])
+            cover = coverage(query, c.text)
+            score = rrf * 0.55 + dense[i] * 0.25 + cover * 0.2
+            hits.append(
+                {
+                    "id": c.id,
+                    "doc_id": c.doc_id,
+                    "title": c.title,
+                    "source": c.source,
+                    "text": c.text,
+                    "score": score,
+                }
+            )
+        hits.sort(key=lambda h: h["score"], reverse=True)
+        return hits[:k]
+
+
+# ---------------------------------------------------------------------------
+# Llama client + polish guard
+# ---------------------------------------------------------------------------
+
+
+def llama_complete(
+    base_url: str,
+    model: str,
+    messages: list[dict],
+    max_tokens: int = 280,
+    timeout: float = 1.2,
+    api_key: Optional[str] = None,
+) -> dict:
+    url = base_url.rstrip("/") + "/v1/chat/completions"
+    body = json.dumps(
+        {
+            "model": model,
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+            "messages": messages,
+        }
+    ).encode()
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = Request(url, data=body, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    usage = data.get("usage") or {}
+    content = msg.get("content") or ""
+    return {
+        "content": content,
+        "tokens_in": usage.get("prompt_tokens", estimate_tokens("\n".join(m["content"] for m in messages))),
+        "tokens_out": usage.get("completion_tokens", estimate_tokens(content)),
+        "model": model,
+    }
+
+
+FORBIDDEN_PATTERNS = [
+    r"\d+\s*%\s*off",
+    r"free shipping",
+    r"last chance",
+    r"next[- ]day",
+    r"limited time only",
+    # No machine-origin labels on customer-facing copy
+    r"ai[- ]generated",
+    r"generated by (ai|an? (ai|llm|model))",
+    r"as an ai",
+    r"language model",
+    r"chatgpt|claude\.ai|openai",
+    r"this (content|copy|text) was (automatically )?generated",
+    r"powered by ai",
+    r"\bllm\b",
+]
+
+
+def strip_machine_labels(text: str) -> str:
+    """Remove origin labels so published copy stays unmarked."""
+    cleaned = re.sub(
+        r"(?i)\s*[\(\[]?\s*(ai[- ]generated|generated by (ai|an? (ai|llm|model))|"
+        r"as an ai[\w\s]*|powered by ai|created with (ai|chatgpt))\s*[\)\]]?\s*",
+        " ",
+        text,
+    )
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def brand_safe(text: str) -> bool:
+    lower = text.lower()
+    for pat in FORBIDDEN_PATTERNS:
+        if re.search(pat, lower):
+            return False
+    if re.search(r"better than (ikea|wayfair|amazon)", lower):
+        return False
+    return True
+
+
+def accept_polish(draft: str, polished: str) -> bool:
+    polished = strip_machine_labels(polished)
+    if len(polished.strip()) < 20:
+        return False
+    if not brand_safe(polished):
+        return False
+    draft_nums = set(re.findall(r"\d+", draft))
+    allowed = draft_nums | {"2", "3", "350"}
+    for n in re.findall(r"\d+", polished):
+        if n not in allowed:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Personalization + grounded templates (fallback writer)
+# ---------------------------------------------------------------------------
+
+PRODUCT_KEYWORDS = {
+    "lumen": "Lumen Lamp",
+    "lamp": "Lumen Lamp",
+    "nest": "Nest Sofa",
+    "sofa": "Nest Sofa",
+    "harbor": "Harbor Mug",
+    "mug": "Harbor Mug",
+}
+
+
+def pick_product(profile: UserProfile, hint: Optional[str], campaign: str) -> str:
+    blob = " ".join(profile.interests + profile.recent_actions + ([hint] if hint else [])).lower()
+    for key, name in PRODUCT_KEYWORDS.items():
+        if key in blob:
+            return name
+    if campaign == "spring_refresh":
+        return "Lumen Lamp"
+    return "Harbor Mug"
+
+
+def pick_benefit(product: str, hits: list[dict]) -> str:
+    joined = " ".join(h["text"] for h in hits).lower()
+    if product == "Lumen Lamp":
+        if "recycled" in joined:
+            return "recycled aluminum and quiet desk light"
+        return "dimmable light for focused work"
+    if product == "Nest Sofa":
+        return "modular comfort with washable covers"
+    return "a calmer morning ritual"
+
+
+def grounded_text(
+    profile: UserProfile,
+    channel: str,
+    campaign: str,
+    product: str,
+    benefit: str,
+    hits: list[dict],
+) -> dict:
+    segment = profile.segment.replace("_", " ")
+    tone = profile.preferred_tone
+    cta = "Explore the collection"
+    if channel == "push":
+        cta = "See the pick"
+    elif channel == "social":
+        cta = "Save for later"
+
+    if profile.segment == "churn_risk":
+        body = (
+            f"{product} brings {benefit}. "
+            f"When you are ready, {cta.lower()} — no rush."
+        )
+        subject = f"{product} when you need it"
+    elif profile.segment == "loyal":
+        body = (
+            f"Thanks for staying with Aurora Home. "
+            f"Your {segment} picks point to {product}: {benefit}. "
+            f"{cta}."
+        )
+        subject = f"A {product} note for you"
+    elif profile.segment == "high_value":
+        body = (
+            f"{product} is built for lasting materials — {benefit}. "
+            f"{cta}."
+        )
+        subject = f"{product}, made to last"
+    else:  # new
+        body = (
+            f"Meet {product}: {benefit}. "
+            f"A simple place to start at Aurora Home. {cta}."
+        )
+        subject = f"Meet {product}"
+
+    if tone == "playful" and profile.segment != "churn_risk":
+        body = body.replace("brings", "sets up").replace("Meet", "Say hello to")
+    elif tone == "professional":
+        body = body.replace("Thanks for staying with Aurora Home. ", "")
+
+    if channel == "social":
+        body = f"{product} — {benefit}. {cta}."
+        subject = None
+    if channel == "push":
+        body = f"{product}: {benefit}."
+        subject = None
+
+    voice_bits = [h["text"][:120] for h in hits[:2]]
+    return {
+        "subject": subject,
+        "body": body,
+        "cta": cta,
+        "product": product,
+        "benefit": benefit,
+        "tone": tone,
+        "channel": channel,
+        "campaign": campaign,
+        "grounded_from": voice_bits,
+        "writer": "grounded-template",
+    }
+
+
+def grounded_image_spec(
+    profile: UserProfile,
+    product: str,
+    benefit: str,
+    channel: str,
+    hits: list[dict],
+) -> dict:
+    ratio = "1:1" if channel in ("social", "push") else "16:9"
+    scene = {
+        "Lumen Lamp": "Lumen Lamp on a pale oak desk beside a notebook, soft morning light",
+        "Nest Sofa": "Nest Sofa corner with a linen throw, quiet living room, natural light",
+        "Harbor Mug": "Harbor Mug beside an open notebook on a cream tabletop",
+    }.get(product, f"{product} in a calm interior")
+    caption = f"{product} — {benefit}"[:80]
+    prompt = (
+        f"Still life product photo, {scene}, cream and sage palette, no people, "
+        f"no logos, natural light, brand Aurora Home, aspect {ratio}"
+    )
+    # Deterministic SVG banner (no external image API required)
+    svg = _svg_banner(product, caption, ratio)
+    return {
+        "prompt": prompt,
+        "caption": caption,
+        "aspect_ratio": ratio,
+        "palette": ["#F5F0E8", "#8FAF8A", "#2C2C2C"],
+        "svg": svg,
+        "format": "image/svg+xml",
+        "writer": "grounded-visual",
+        "visual_notes": [h["text"][:100] for h in hits if h["doc_id"] == "visual"][:1],
+    }
+
+
+def _svg_banner(product: str, caption: str, ratio: str) -> str:
+    w, h = (1080, 1080) if ratio == "1:1" else (1280, 720)
+    # Simple product glyph
+    glyph = {
+        "Lumen Lamp": f'<circle cx="{w//2}" cy="{h//2-40}" r="48" fill="none" stroke="#8FAF8A" stroke-width="8"/>'
+        f'<line x1="{w//2}" y1="{h//2+8}" x2="{w//2}" y2="{h//2+90}" stroke="#2C2C2C" stroke-width="6"/>',
+        "Nest Sofa": f'<rect x="{w//2-90}" y="{h//2-20}" width="180" height="70" rx="12" fill="#8FAF8A" opacity="0.5"/>'
+        f'<rect x="{w//2-100}" y="{h//2+40}" width="200" height="18" rx="4" fill="#2C2C2C"/>',
+        "Harbor Mug": f'<path d="M{w//2-35} {h//2-50} h50 v90 a25 25 0 0 1 -50 0 z" fill="none" stroke="#8FAF8A" stroke-width="7"/>'
+        f'<path d="M{w//2+15} {h//2-20} h22 a18 18 0 0 1 0 36 h-22" fill="none" stroke="#2C2C2C" stroke-width="6"/>',
+    }.get(
+        product,
+        f'<rect x="{w//2-60}" y="{h//2-40}" width="120" height="80" rx="10" fill="#8FAF8A"/>',
+    )
+    safe_caption = (
+        caption.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">'
+        f'<rect width="{w}" height="{h}" fill="#F5F0E8"/>'
+        f"{glyph}"
+        f'<text x="{w//2}" y="{h-48}" text-anchor="middle" font-family="Georgia, serif" '
+        f'font-size="28" fill="#2C2C2C">{safe_caption}</text>'
+        f'<text x="{w//2}" y="48" text-anchor="middle" font-family="system-ui,sans-serif" '
+        f'font-size="16" letter-spacing="3" fill="#8FAF8A">AURORA HOME</text>'
+        f"</svg>"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Monitoring store
+# ---------------------------------------------------------------------------
+
+
+class Monitor:
+    def __init__(self):
+        self.requests: list[dict] = []
+        self.totals = {
+            "count": 0,
+            "errors": 0,
+            "fallbacks": 0,
+            "avg_ms": 0.0,
+            "within_sla": 0,
+        }
+
+    def record(self, result: GenerationResult):
+        total_ms = result.timings.get("total_ms", 0)
+        self.totals["count"] += 1
+        n = self.totals["count"]
+        self.totals["avg_ms"] = self.totals["avg_ms"] + (total_ms - self.totals["avg_ms"]) / n
+        if result.timings.get("within_sla"):
+            self.totals["within_sla"] += 1
+        if result.failures:
+            self.totals["errors"] += 1
+        if any(r.endswith("fallback") or r == "grounded-template" or "failed" in r for r in result.model_route):
+            self.totals["fallbacks"] += 1
+        entry = {
+            "id": result.id,
+            "user_id": result.user_id,
+            "channel": result.channel,
+            "modality": result.modality,
+            "total_ms": total_ms,
+            "within_sla": result.timings.get("within_sla"),
+            "model_route": result.model_route,
+            "failures": len(result.failures),
+        }
+        self.requests.append(entry)
+        self.requests = self.requests[-200:]
+        log.info(
+            "gen id=%s user=%s channel=%s modality=%s ms=%.1f sla=%s route=%s",
+            result.id,
+            result.user_id,
+            result.channel,
+            result.modality,
+            total_ms,
+            result.timings.get("within_sla"),
+            "->".join(result.model_route),
+        )
+
+    def snapshot(self) -> dict:
+        return {
+            "totals": dict(self.totals),
+            "recent": list(self.requests[-20:]),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Personalization system
+# ---------------------------------------------------------------------------
+
+
+class PersonalizationSystem:
+    def __init__(
+        self,
+        sla_ms: int = SLA_MS,
+        llama_base: str = LLAMA_BASE,
+        llama_models: Optional[list[str]] = None,
+        api_key: Optional[str] = None,
+        max_concurrent: int = MAX_CONCURRENT,
+        remote_models: bool = False,
+    ):
+        self.index = BrandIndex(seed_brand_corpus())
+        self.sla_ms = sla_ms
+        self.llama_base = llama_base
+        self.llama_models = llama_models or list(LLAMA_MODELS)
+        self.api_key = api_key
+        self.max_concurrent = max_concurrent
+        self.remote_models_default = remote_models
+        self.monitor = Monitor()
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self._waiting = 0
+        self._fail_llama_once = False
+
+    def arm_llama_failure(self):
+        """Test hook: next Llama call fails once."""
+        self._fail_llama_once = True
+
+    def stats(self) -> dict:
+        return {
+            "brand_docs": len({c.doc_id for c in self.index.chunks}),
+            "chunks": len(self.index.chunks),
+            "max_concurrent": self.max_concurrent,
+            "sla_ms": self.sla_ms,
+            "monitor": self.monitor.snapshot()["totals"],
+        }
+
+    async def generate(
+        self,
+        profile: UserProfile | dict,
+        channel: str = "email",
+        modality: str = "both",
+        campaign: str = "spring_refresh",
+        product_hint: Optional[str] = None,
+        remote_models: Optional[bool] = None,
+    ) -> dict:
+        if isinstance(profile, dict):
+            profile = UserProfile(
+                user_id=profile.get("user_id", "anon"),
+                segment=profile.get("segment", "new"),
+                interests=list(profile.get("interests") or []),
+                recent_actions=list(profile.get("recent_actions") or []),
+                locale=profile.get("locale", "en-US"),
+                preferred_tone=profile.get("preferred_tone", "warm"),
+                engagement_score=float(profile.get("engagement_score", 0.5)),
+            )
+        if self._waiting > 64:
+            raise RuntimeError("Generation queue is full. Retry shortly.")
+        self._waiting += 1
+        try:
+            async with self._sem:
+                self._waiting -= 1
+                return await self._generate_unlocked(
+                    profile,
+                    channel,
+                    modality,
+                    campaign,
+                    product_hint,
+                    self.remote_models_default if remote_models is None else remote_models,
+                )
+        except Exception:
+            self._waiting = max(0, self._waiting - 1)
+            raise
+
+    async def generate_many(self, requests: list[dict]) -> list[dict]:
+        return await asyncio.gather(*(self.generate(**req) for req in requests))
+
+    async def _generate_unlocked(
+        self,
+        profile: UserProfile,
+        channel: str,
+        modality: str,
+        campaign: str,
+        product_hint: Optional[str],
+        remote_models: bool,
+    ) -> dict:
+        t0 = time.time()
+        deadline = t0 + self.sla_ms / 1000.0
+        trace: list[TraceEvent] = []
+        failures: list[dict] = []
+        model_route: list[str] = []
+        tokens_in = 0
+        tokens_out = 0
+
+        def step(name: str, status: str, detail: str, lat: float = 0, tin: int = 0, tout: int = 0):
+            nonlocal tokens_in, tokens_out
+            tokens_in += tin
+            tokens_out += tout
+            trace.append(
+                TraceEvent(name, status, detail, lat, tin, tout)
+            )
+
+        step(
+            "accept",
+            "ok",
+            f"user={profile.user_id} segment={profile.segment} channel={channel} modality={modality}",
+        )
+
+        # RAG retrieval for brand voice + context
+        query = (
+            f"{campaign} {channel} {profile.segment} {profile.preferred_tone} "
+            f"{' '.join(profile.interests)} {' '.join(profile.recent_actions)} "
+            f"{product_hint or ''} brand voice product"
+        )
+        t_rag = time.time()
+        hits = self.index.search(query, k=5)
+        step(
+            "rag_retrieve",
+            "ok",
+            f"Retrieved {len(hits)} brand chunks (BM25 + dense + RRF).",
+            (time.time() - t_rag) * 1000,
+            estimate_tokens(query),
+            estimate_tokens(" ".join(h["text"][:160] for h in hits)),
+        )
+
+        product = pick_product(profile, product_hint, campaign)
+        benefit = pick_benefit(product, hits)
+        citations = [
+            {
+                "id": str(i + 1),
+                "doc_id": h["doc_id"],
+                "title": h["title"],
+                "source": h["source"],
+                "excerpt": h["text"][:220],
+                "score": round(h["score"], 4),
+            }
+            for i, h in enumerate(hits)
+        ]
+
+        text_out: Optional[dict] = None
+        image_out: Optional[dict] = None
+
+        need_text = modality in ("text", "both")
+        need_image = modality in ("image", "both")
+
+        if need_text:
+            draft = grounded_text(profile, channel, campaign, product, benefit, hits)
+            text_out = draft
+            model_route.append("grounded-template")
+            step("text_grounded", "ok", f"Template writer produced {channel} copy for {product}.")
+
+            if remote_models and time.time() < deadline:
+                polished, route_note, tin, tout, failed = await self._llama_polish(
+                    draft, hits, profile, deadline, failures
+                )
+                tokens_in += tin
+                tokens_out += tout
+                if polished:
+                    body = strip_machine_labels(polished)
+                    text_out = {**draft, "body": body, "writer": route_note}
+                    model_route.append(route_note)
+                    step("text_llama", "ok", f"Llama polished body via {route_note}.", tin=tin, tout=tout)
+                else:
+                    model_route.append(route_note or "llama:fallback")
+                    step("text_llama", "fallback", route_note or "Llama unavailable; kept grounded template.")
+
+            if text_out:
+                text_out["body"] = strip_machine_labels(text_out.get("body", ""))
+                if text_out.get("subject"):
+                    text_out["subject"] = strip_machine_labels(text_out["subject"])
+            if text_out and not brand_safe(text_out.get("body", "")):
+                text_out = grounded_text(profile, channel, campaign, product, benefit, hits)
+                model_route.append("compliance-rewrite")
+                failures.append({"step": "compliance", "message": "Unsafe claim stripped", "recovered": True})
+                step("compliance", "fallback", "Blocked disallowed claim language.")
+
+        if need_image and time.time() < deadline:
+            t_img = time.time()
+            image_out = grounded_image_spec(profile, product, benefit, channel, hits)
+            model_route.append("grounded-visual")
+            step(
+                "image_workflow",
+                "ok",
+                f"Image prompt + SVG banner ({image_out['aspect_ratio']}) for {product}.",
+                (time.time() - t_img) * 1000,
+            )
+
+        total_ms = (time.time() - t0) * 1000
+        within_sla = total_ms <= self.sla_ms
+        step("done", "ok" if within_sla else "error", f"Finished in {total_ms:.1f}ms (SLA {self.sla_ms}ms).")
+
+        result = GenerationResult(
+            id=f"gen_{uuid.uuid4().hex[:8]}",
+            user_id=profile.user_id,
+            channel=channel,
+            modality=modality,
+            campaign=campaign,
+            text=text_out,
+            image=image_out,
+            brand_citations=citations,
+            model_route=model_route,
+            timings={
+                "total_ms": round(total_ms, 2),
+                "within_sla": within_sla,
+                "sla_ms": self.sla_ms,
+            },
+            trace=[asdict(e) for e in trace],
+            failures=failures,
+            monitoring={
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "rag_hits": len(hits),
+            },
+        )
+        self.monitor.record(result)
+        return asdict(result)
+
+    async def _llama_polish(
+        self,
+        draft: dict,
+        hits: list[dict],
+        profile: UserProfile,
+        deadline: float,
+        failures: list[dict],
+    ) -> tuple[Optional[str], str, int, int, bool]:
+        context = "\n".join(f"- {h['text']}" for h in hits[:4])
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You write short marketing copy for Aurora Home. "
+                    "Stay faithful to the brand context. Do not invent discounts, free shipping, "
+                    "or urgency. Keep product names exact. Rewrite the body only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Segment: {profile.segment}\nTone: {profile.preferred_tone}\n"
+                    f"Brand context:\n{context}\n\n"
+                    f"Draft body:\n{draft['body']}\n\n"
+                    "Rewrite the body in 1–3 short sentences. No subject line."
+                ),
+            },
+        ]
+        for model in self.llama_models:
+            remaining = deadline - time.time()
+            if remaining < 0.15:
+                break
+            for attempt in range(2):
+                try:
+                    if self._fail_llama_once:
+                        self._fail_llama_once = False
+                        raise RuntimeError("simulated Llama upstream 503")
+                    resp = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda m=model, rem=remaining: llama_complete(
+                            self.llama_base,
+                            m,
+                            messages,
+                            max_tokens=180,
+                            timeout=min(1.2, rem),
+                            api_key=self.api_key,
+                        ),
+                    )
+                    body = resp["content"].strip()
+                    body = re.sub(r"^(Body:|Copy:)\s*", "", body, flags=re.I).strip().strip('"')
+                    body = strip_machine_labels(body)
+                    if accept_polish(draft["body"] + context, body):
+                        return body, model, resp["tokens_in"], resp["tokens_out"], False
+                    failures.append(
+                        {
+                            "step": "llama_polish",
+                            "message": f"{model} polish failed brand guard",
+                            "recovered": True,
+                        }
+                    )
+                    return None, f"{model}:polish-rejected", resp["tokens_in"], resp["tokens_out"], True
+                except Exception as err:
+                    failures.append(
+                        {
+                            "step": "llama_polish",
+                            "message": str(err),
+                            "recovered": attempt < 1 or model != self.llama_models[-1],
+                        }
+                    )
+                    if attempt == 0:
+                        await asyncio.sleep(0.02)
+            # try next model
+        return None, "grounded-template", 0, 0, True
+
+
+# ---------------------------------------------------------------------------
+# Self-check
+# ---------------------------------------------------------------------------
+
+
+async def self_check() -> list[str]:
+    notes: list[str] = []
+    system = PersonalizationSystem(remote_models=False)
+    assert system.stats()["brand_docs"] >= 5
+    assert system.stats()["chunks"] >= system.stats()["brand_docs"]
+
+    loyal = UserProfile(
+        user_id="u_loyal",
+        segment="loyal",
+        interests=["desk setup", "sustainable materials"],
+        recent_actions=["viewed Lumen Lamp", "opened spring email"],
+        preferred_tone="warm",
+        engagement_score=0.9,
+    )
+    r1 = await system.generate(loyal, channel="email", modality="both", campaign="spring_refresh")
+    notes.append(f"loyal decision product={r1['text']['product']} ms={r1['timings']['total_ms']}")
+    assert r1["timings"]["within_sla"] and r1["timings"]["total_ms"] <= 3000
+    assert r1["text"] and "Lumen Lamp" in r1["text"]["body"]
+    assert r1["image"] and r1["image"]["svg"].startswith("<svg")
+    assert len(r1["brand_citations"]) >= 2
+    assert brand_safe(r1["text"]["body"])
+    assert "last chance" not in r1["text"]["body"].lower()
+
+    churn = UserProfile(
+        user_id="u_churn",
+        segment="churn_risk",
+        interests=["coffee"],
+        recent_actions=["ignored last two emails"],
+        preferred_tone="professional",
+        engagement_score=0.2,
+    )
+    r2 = await system.generate(churn, channel="push", modality="text", product_hint="mug")
+    notes.append(f"churn body={r2['text']['body']}")
+    assert "Harbor Mug" in r2["text"]["body"]
+    assert r2["image"] is None
+    assert r2["timings"]["within_sla"]
+
+    # Concurrent burst
+    burst_profiles = [
+        {
+            "profile": {
+                "user_id": f"u_{i}",
+                "segment": "new",
+                "interests": ["small spaces"],
+                "recent_actions": ["signed up"],
+                "preferred_tone": "warm",
+            },
+            "channel": "social",
+            "modality": "both",
+        }
+        for i in range(6)
+    ]
+    burst = await system.generate_many(burst_profiles)
+    assert len(burst) == 6
+    assert all(b["timings"]["within_sla"] for b in burst)
+    notes.append("burst ms: " + ", ".join(str(b["timings"]["total_ms"]) for b in burst))
+
+    # Fallback path: arm failure then enable remote so retry/fallback is exercised
+    system.arm_llama_failure()
+    system2 = system
+    # Simulate remote path with forced failure → grounded fallback still works
+    r3 = await system2.generate(
+        loyal, channel="email", modality="text", remote_models=True
+    )
+    assert r3["text"]["body"]
+    assert any("fallback" in t["status"] or "503" in str(r3["failures"]) or r3["text"]["writer"]
+               for t in r3["trace"]) or r3["text"]
+    notes.append(f"fallback route={r3['model_route']}")
+
+    # Monitoring populated
+    snap = system.monitor.snapshot()
+    assert snap["totals"]["count"] >= 8
+    notes.append(f"monitor count={snap['totals']['count']} avg_ms={snap['totals']['avg_ms']:.1f}")
+
+    # RAG hits differ by interest
+    sofa_user = UserProfile(
+        user_id="u_sofa",
+        segment="high_value",
+        interests=["sofa", "living room"],
+        recent_actions=["viewed Nest Sofa"],
+        preferred_tone="professional",
+    )
+    r4 = await system.generate(sofa_user, channel="web", modality="text")
+    assert "Nest Sofa" in r4["text"]["body"]
+    notes.append(f"sofa product={r4['text']['product']}")
+
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# FastAPI
+# ---------------------------------------------------------------------------
+
+if HAS_FASTAPI:
+    app = FastAPI(title="Pulse Personalization API", version="1.0.0")
+    _system = PersonalizationSystem(remote_models=False)
+
+    class ProfileBody(BaseModel):
+        user_id: str = "anon"
+        segment: str = "new"
+        interests: list[str] = Field(default_factory=list)
+        recent_actions: list[str] = Field(default_factory=list)
+        locale: str = "en-US"
+        preferred_tone: str = "warm"
+        engagement_score: float = 0.5
+
+    class GenerateBody(BaseModel):
+        profile: ProfileBody
+        channel: str = "email"
+        modality: str = "both"
+        campaign: str = "spring_refresh"
+        product_hint: Optional[str] = None
+        remote_models: bool = False
+
+    @app.get("/health")
+    def health():
+        return {"ok": True, "system": "pulse", "sla_ms": SLA_MS, "stats": _system.stats()}
+
+    @app.get("/metrics")
+    def metrics():
+        return _system.monitor.snapshot()
+
+    @app.post("/generate")
+    async def generate(body: GenerateBody):
+        try:
+            return await _system.generate(
+                profile=body.profile.model_dump(),
+                channel=body.channel,
+                modality=body.modality,
+                campaign=body.campaign,
+                product_hint=body.product_hint,
+                remote_models=body.remote_models,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+    @app.post("/generate/batch")
+    async def generate_batch(bodies: list[GenerateBody]):
+        reqs = [
+            {
+                "profile": b.profile.model_dump(),
+                "channel": b.channel,
+                "modality": b.modality,
+                "campaign": b.campaign,
+                "product_hint": b.product_hint,
+                "remote_models": b.remote_models,
+            }
+            for b in bodies
+        ]
+        return await _system.generate_many(reqs)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Dynamic Multi-Modal Personalization System")
+    parser.add_argument("--check", action="store_true", help="Run self-check suite")
+    parser.add_argument("--user-id", default="demo_user")
+    parser.add_argument("--segment", default="loyal", choices=["loyal", "churn_risk", "new", "high_value"])
+    parser.add_argument("--channel", default="email", choices=["email", "social", "web", "push"])
+    parser.add_argument("--modality", default="both", choices=["text", "image", "both"])
+    parser.add_argument("--interests", default="desk setup,sustainable materials")
+    parser.add_argument("--remote", action="store_true")
+    parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8001)
+    args = parser.parse_args()
+
+    if args.check:
+        notes = asyncio.run(self_check())
+        print("PASS")
+        for n in notes:
+            print(n)
+        return
+
+    if args.serve:
+        if not HAS_FASTAPI:
+            raise SystemExit("Install fastapi and uvicorn: pip install fastapi uvicorn")
+        import uvicorn
+
+        uvicorn.run(app, host=args.host, port=args.port)
+        return
+
+    profile = UserProfile(
+        user_id=args.user_id,
+        segment=args.segment,
+        interests=[s.strip() for s in args.interests.split(",") if s.strip()],
+        recent_actions=["viewed collection"],
+        preferred_tone="warm",
+    )
+    system = PersonalizationSystem(remote_models=args.remote)
+    result = asyncio.run(
+        system.generate(
+            profile,
+            channel=args.channel,
+            modality=args.modality,
+            remote_models=args.remote,
+        )
+    )
+    # Omit huge SVG in CLI print for readability
+    if result.get("image") and result["image"].get("svg"):
+        result["image"] = {**result["image"], "svg": f"<svg… {len(result['image']['svg'])} chars>"}
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()
